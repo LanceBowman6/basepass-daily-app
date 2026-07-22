@@ -12,10 +12,11 @@ import {
   useSendCalls,
   useSendTransaction,
   useSwitchChain,
+  useWaitForCallsStatus,
   useWaitForTransactionReceipt,
 } from "wagmi";
 import { basePassDailyAbi } from "@/abi/basePassDaily";
-import { config, contractAddress, dataSuffix } from "@/lib/wagmi";
+import { builderCode, config, contractAddress, dataSuffix } from "@/lib/wagmi";
 
 type WalletKind = "okx" | "metamask" | "coinbase";
 
@@ -93,6 +94,12 @@ function friendlyWalletError(error: unknown) {
   return error.message;
 }
 
+function prefersCalls(connector?: Connector) {
+  const id = connector?.id.toLowerCase() ?? "";
+  const name = connector?.name.toLowerCase() ?? "";
+  return id.includes("coinbase") || name.includes("coinbase") || id.includes("baseaccount") || name.includes("base account");
+}
+
 export default function Home() {
   const [message, setMessage] = useState("");
   const [origin, setOrigin] = useState("");
@@ -103,7 +110,7 @@ export default function Home() {
     return ref && isAddress(ref) ? ref : zeroAddress;
   });
 
-  const { address, chainId, isConnected } = useAccount();
+  const { address, chainId, connector, isConnected } = useAccount();
   const { connectAsync, connectors, error: connectError, isPending: isConnecting } = useConnect();
   const { disconnect } = useDisconnect();
   const { switchChainAsync } = useSwitchChain();
@@ -119,7 +126,13 @@ export default function Home() {
     error: sendTransactionError,
     isPending: isSendingTransaction,
   } = useSendTransaction({ config });
+  const { data: callsStatus, isSuccess: isCallsSuccess } = useWaitForCallsStatus({
+    config,
+    id: callsResult?.id,
+    query: { enabled: Boolean(callsResult?.id) },
+  });
   const { isLoading: isConfirming, isSuccess } = useWaitForTransactionReceipt({ config, hash });
+  const callReceiptHash = callsStatus?.receipts?.[0]?.transactionHash;
 
   const isOnchain = Boolean(contractAddress);
   const isBusy = isConnecting || isSendingCalls || isSendingTransaction || isConfirming;
@@ -192,13 +205,13 @@ export default function Home() {
   }, [address, isOnchain, localStats]);
 
   useEffect(() => {
-    if (!isSuccess) return;
-    queueMicrotask(() => setMessage("Transaction confirmed."));
+    if (!isSuccess && !isCallsSuccess) return;
+    queueMicrotask(() => setMessage("Transaction confirmed. Stats refreshed."));
     void userReads.refetch();
     void rewardReads.refetch();
     void rewardCount.refetch();
     void raffleEntryCost.refetch();
-  }, [isSuccess, raffleEntryCost, rewardCount, rewardReads, userReads]);
+  }, [isCallsSuccess, isSuccess, raffleEntryCost, rewardCount, rewardReads, userReads]);
 
   const [checkIns = 0n, points = 0n, lastDay = 0n, streak = 0n, raffleEntries = 0n] = userReads.data ?? [];
 
@@ -261,30 +274,33 @@ export default function Home() {
   async function sendAttributedContractCall(callData: Hex) {
     if (!contractAddress) return;
     await ensureBase();
+    const attributedCallData = concatHex([callData, dataSuffix]);
 
-    try {
-      const result = await sendCallsAsync({
-        calls: [{ to: contractAddress, data: callData }],
-        capabilities: { dataSuffix: { value: dataSuffix } },
-        chainId: 8453,
-        experimental_fallback: true,
-      });
-      setMessage(`Call submitted: ${result.id}`);
-      return;
-    } catch (error) {
-      setMessage("Smart wallet batch failed. Opening wallet transaction...");
-      console.info("wallet_sendCalls failed, falling back to sendTransaction", error);
+    if (prefersCalls(connector)) {
+      try {
+        const result = await sendCallsAsync({
+          calls: [{ to: contractAddress, data: attributedCallData }],
+          capabilities: { dataSuffix: { value: dataSuffix, optional: true } },
+          chainId: 8453,
+          experimental_fallback: true,
+        });
+        setMessage(`Call submitted: ${result.id}`);
+        return;
+      } catch (error) {
+        setMessage("Smart wallet batch failed. Opening wallet transaction...");
+        console.info("wallet_sendCalls failed, falling back to sendTransaction", error);
+      }
     }
 
     await sendTransactionAsync({
       to: contractAddress,
-      data: concatHex([callData, dataSuffix]),
+      data: callData,
       chainId: 8453,
     });
   }
 
   async function claimDailyPass() {
-    if (!address || stats.claimedToday) return;
+    if (!address) return;
     setMessage("Claiming Daily Pass...");
 
     if (!isOnchain || !contractAddress) {
@@ -408,11 +424,11 @@ export default function Home() {
         <section className="space-y-3 rounded-[8px] border border-white/10 bg-[#101216] p-4">
           <button
             type="button"
-            disabled={!isConnected || stats.claimedToday || isBusy}
+            disabled={!isConnected || isBusy}
             onClick={() => void claimDailyPass()}
             className="primary-button"
           >
-            {stats.claimedToday ? "Claimed Today" : "Claim Daily Pass"}
+            Claim Daily Pass
           </button>
           <p className="text-xs text-white/45">{isOnchain ? "Onchain mode: user pays Base gas." : "Local mode: no gas required."}</p>
         </section>
@@ -459,18 +475,26 @@ export default function Home() {
           <p className="mt-2 text-xs text-white/45">Active referrer: {referrer === zeroAddress ? "None" : shortAddress(referrer)}</p>
         </section>
 
-        {hash ? (
+        {hash || callReceiptHash ? (
           <a
-            href={`https://basescan.org/tx/${hash}`}
+            href={`https://basescan.org/tx/${hash ?? callReceiptHash}`}
             target="_blank"
             rel="noreferrer"
             className="block truncate text-sm text-[#9ee7cf] underline-offset-4 hover:underline"
           >
-            Transaction: {hash}
+            Transaction: {hash ?? callReceiptHash}
           </a>
         ) : null}
 
         {callsResult?.id ? <p className="break-all text-xs text-white/45">Call batch: {callsResult.id}</p> : null}
+
+        <section className="rounded-[8px] border border-white/10 bg-[#101216] p-4">
+          <h2 className="font-semibold">Attribution</h2>
+          <p className="mt-2 break-all text-xs text-white/45">Mode: {isOnchain ? "Onchain" : "Local"}</p>
+          <p className="mt-1 break-all text-xs text-white/45">Contract: {contractAddress ?? "Not configured"}</p>
+          <p className="mt-1 break-all text-xs text-white/45">Builder Code: {builderCode}</p>
+          <p className="mt-1 break-all text-xs text-white/45">Data Suffix: {dataSuffix}</p>
+        </section>
       </div>
     </main>
   );
